@@ -31,12 +31,29 @@ EMOJI = {"Strong Buy": "🟢🟢", "Buy": "🟢", "Hold": "🟡", "Sell": "🔴"
          "Strong Sell": "🔴🔴"}
 
 # ---------------------------------------------------------------- load
-@st.cache_data(ttl=600)
-def load_data():
+@st.cache_data(ttl=600, show_spinner=False)
+def read_outputs():
+    """Read committed CSVs (cached 10 min)."""
     sig = pd.read_csv("advisor_signals.csv")
     bt = pd.read_csv("advisor_backtest.csv", parse_dates=["date"])
     px_df = pd.read_csv("advisor_prices.csv", index_col=0, parse_dates=True)
     return sig, bt, px_df
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def live_fetch():
+    """Fetch fresh data + regenerate signals/backtest CSVs, then read them."""
+    from multi_asset_advisor import fetch_and_score
+    fetch_and_score(progress_fn=None)
+    return read_outputs.__wrapped__()
+
+
+def load_data():
+    try:
+        return read_outputs()
+    except Exception:
+        # CSV missing/stale -> fetch fresh, then rebuild
+        return live_fetch()
 
 
 def calc_indicators(close, name):
@@ -464,7 +481,24 @@ def tab_private():
 
 # ------------------------------------------------------------------ main
 def main():
+    global SIG, BT, PX, HAVE_DATA
     advisor_header()
+    with st.sidebar:
+        st.markdown("### ⚙️ Data")
+        last_date = PX.index.max().date() if HAVE_DATA and len(PX) else None
+        st.caption(f"Prices through **{last_date}**")
+        if st.button("🔄 Refresh live data", use_container_width=True):
+            with st.spinner("Fetching fresh market data..."):
+                read_outputs.clear()
+                live_fetch.clear()
+                try:
+                    globals_updated = load_data()
+                    SIG, BT, PX = globals_updated
+                    HAVE_DATA = True
+                    _build_cat()
+                    st.success("Updated with live prices!")
+                except Exception as e:
+                    st.error(f"Refresh failed: {e}")
     if not HAVE_DATA:
         return
     _build_cat()

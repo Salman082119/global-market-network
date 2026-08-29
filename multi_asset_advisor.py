@@ -29,8 +29,10 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from datetime import date
+
 START = "2007-01-01"      # after 2006 data so indicators have warm-up
-END = "2025-01-01"
+END = date.today().isoformat()
 
 # ------------------------------------------------------------------ universe
 UNIVERSE = {
@@ -201,12 +203,23 @@ def backtest(prices, months_back=60):
                          "strategy": strat, "benchmark": bench})
 
 
-# ---------------------------------------------------------------- main
-def main():
-    print("Fetching universe...")
+# ---------------------------------------------------------------- pipeline
+def fetch_and_score(progress_fn=None, min_age_days=0.5):
+    """Fetch fresh prices and regenerate signals/backtest CSVs.
+
+    Returns (signals_df, backtest_df, prices_df).
+    progress_fn(text) is called with status messages (optional).
+    """
+    def say(t):
+        if progress_fn:
+            progress_fn(t)
+        else:
+            print(t)
+
+    say("Fetching fresh market data...")
     prices = fetch_prices()
     prices.to_csv("advisor_prices.csv")
-    print(f"Universe: {prices.shape[1]} assets, {prices.shape[0]} days\n")
+    say(f"Universe: {prices.shape[1]} assets, {prices.shape[0]} days")
 
     rows = []
     for name in prices.columns:
@@ -215,20 +228,25 @@ def main():
                      **b})
     sig = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
     sig.to_csv("advisor_signals.csv", index=False)
-    print(pd.DataFrame({
-        "asset": [a.split(" ", 1)[1] if " " in a else a for a in sig["asset"]],
-        "cat": sig["category"], "score": sig["score"], "signal": sig["label"]}).
-        to_string(index=False))
-    print(f"\nSaved advisor_signals.csv ({len(sig)} assets)")
+    say(f"Saved advisor_signals.csv ({len(sig)} assets)")
 
     bt = backtest(prices)
     bt.to_csv("advisor_backtest.csv", index=False)
-    if len(bt):
-        grow = (1 + bt["strategy"]).cumprod()
-        gbench = (1 + bt["benchmark"]).cumprod()
-        print(f"\nBacktest ({len(bt)} monthly re-ranks):")
-        print(f"  Momentum-strategy final multiplier: {grow.iloc[-1]:.2f}x")
-        print(f"  Equal-weight benchmark multiplier:  {gbench.iloc[-1]:.2f}x")
+    return sig, bt, prices
+
+
+def main():
+    _sig, _bt, _prices = fetch_and_score()
+    print(pd.DataFrame({
+        "asset": [a.split(" ", 1)[1] if " " in a else a for a in _sig["asset"]],
+        "cat": _sig["category"], "score": _sig["score"], "signal": _sig["label"]}).
+        to_string(index=False))
+    if len(_bt):
+        grow = (1 + _bt["strategy"]).cumprod().iloc[-1]
+        gbench = (1 + _bt["benchmark"]).cumprod().iloc[-1]
+        print(f"\nBacktest ({len(_bt)} monthly re-ranks):")
+        print(f"  Momentum-strategy final multiplier: {grow:.2f}x")
+        print(f"  Equal-weight benchmark multiplier:  {gbench:.2f}x")
     print("\nDone.")
 
 
