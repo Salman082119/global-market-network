@@ -21,7 +21,16 @@ import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(layout="wide", page_title="Multi-Asset Global Advisor",
-                   initial_sidebar_state="expanded")
+                   page_icon="🌍", initial_sidebar_state="expanded")
+
+st.markdown(
+    "<style>"
+    "@media (max-width: 640px){"
+    ".block-container{padding:1rem .6rem 2rem;}"
+    "h1,h2,h3{line-height:1.2;}"
+    "div[data-testid='stMetricValue']{font-size:1.2rem;}"
+    "}"
+    "</style>", unsafe_allow_html=True)
 
 LABEL_COLORS = {
     "Strong Buy": "#1b7a3d", "Buy": "#4caf50",
@@ -68,6 +77,238 @@ def calc_indicators(close, name):
     macd = c.ewm(span=12, adjust=False).mean() - c.ewm(span=26, adjust=False).mean()
     macdsig = macd.ewm(span=9, adjust=False).mean()
     return c, ema20, ema50, ema200, rsi, macd, macdsig, name
+
+
+# ---------------------------------------------------------------- analytics
+TRADING_DAYS = 252
+
+
+def _returns(col):
+    return PX[col].dropna().pct_change().dropna()
+
+
+def _ann_return(r):
+    if len(r) < 20:
+        return np.nan
+    growth = float((1 + r).prod())
+    years = len(r) / TRADING_DAYS
+    if growth <= 0 or years <= 0:
+        return np.nan
+    return growth ** (1 / years) - 1
+
+
+def risk_metrics(col):
+    """Annualised return/vol, Sharpe, Sortino and max drawdown for one asset."""
+    r = _returns(col)
+    if len(r) < 30:
+        return None
+    c = PX[col].dropna()
+    ann_ret = _ann_return(r)
+    ann_vol = float(r.std() * np.sqrt(TRADING_DAYS))
+    sharpe = ann_ret / ann_vol if ann_vol else np.nan
+    downside = r[r < 0]
+    dvol = float(downside.std() * np.sqrt(TRADING_DAYS)) if len(downside) > 2 else np.nan
+    sortino = ann_ret / dvol if dvol else np.nan
+    mdd = float((c / c.cummax() - 1).min())
+    return {"AnnRet": ann_ret, "Vol": ann_vol, "Sharpe": sharpe,
+            "Sortino": sortino, "MaxDD": mdd}
+
+
+def portfolio_risk(weights):
+    """Annualised metrics for a weighted portfolio. weights: asset -> weight."""
+    cols = [a for a in weights if a in PX.columns and weights[a] > 0]
+    if not cols:
+        return None
+    rets = PX[cols].pct_change().dropna(how="all").fillna(0.0)
+    w = np.array([weights[a] for a in cols], dtype=float)
+    w = w / w.sum()
+    pr = rets.mul(w, axis=1).sum(axis=1)
+    ann_ret = _ann_return(pr)
+    ann_vol = float(pr.std() * np.sqrt(TRADING_DAYS))
+    sharpe = ann_ret / ann_vol if ann_vol else np.nan
+    downside = pr[pr < 0]
+    dvol = float(downside.std() * np.sqrt(TRADING_DAYS)) if len(downside) > 2 else np.nan
+    sortino = ann_ret / dvol if dvol else np.nan
+    eq = (1 + pr).cumprod()
+    mdd = float((eq / eq.cummax() - 1).min())
+    return {"AnnRet": ann_ret, "Vol": ann_vol, "Sharpe": sharpe,
+            "Sortino": sortino, "MaxDD": mdd}
+
+
+def bollinger(close, n=20, k=2):
+    ma = close.rolling(n).mean()
+    sd = close.rolling(n).std()
+    return ma, ma + k * sd, ma - k * sd
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_ohlcv(ticker):
+    """Cached OHLCV download used for ATR / ADX / volume overlays."""
+    import yfinance as yf
+    df = yf.download(ticker, period="2y", progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    keep = [c for c in ["Open", "High", "Low", "Close", "Volume"] if c in df.columns]
+    return df[keep].sort_index()
+
+
+def adx_atr(ohlcv, n=14):
+    high, low, close = ohlcv["High"], ohlcv["Low"], ohlcv["Close"]
+    up, dn = high.diff(), -low.diff()
+    plus_dm = pd.Series(np.where((up > dn) & (up > 0), up, 0.0), index=high.index)
+    minus_dm = pd.Series(np.where((dn > up) & (dn > 0), dn, 0.0), index=high.index)
+    tr = pd.concat([(high - low), (high - close.shift()).abs(),
+                    (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / n, adjust=False).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / n, adjust=False).mean() / atr
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
+    adx = dx.ewm(alpha=1 / n, adjust=False).mean()
+    return plus_di, minus_di, adx, atr
+
+
+def explain_score(row):
+    """Rule-based natural-language explanation of a 0-100 signal score."""
+    comps = [("Trend", row["trend"]), ("RSI / momentum", row["rsi"]),
+             ("MACD", row["macd"]), ("Volatility", row["vol"]),
+             ("52-week position", row["pos"])]
+    notes = []
+    t = row["trend"]
+    if t >= 90:
+        notes.append("**Trend is bullish** — price is above both EMA50 and EMA200.")
+    elif t >= 70:
+        notes.append("**Trend is constructive** — price is above EMA50.")
+    elif t >= 35:
+        notes.append("**Trend is mixed** — price is below EMA50 but above EMA200.")
+    else:
+        notes.append("**Trend is bearish** — price is below its key moving averages.")
+    rv = row.get("rsi_raw", np.nan)
+    if np.isfinite(rv):
+        if rv < 30:
+            notes.append(f"**RSI {rv:.0f}** — oversold, often a mean-reversion buy zone.")
+        elif rv > 70:
+            notes.append(f"**RSI {rv:.0f}** — overbought, momentum may be stretched.")
+        else:
+            notes.append(f"**RSI {rv:.0f}** — neutral momentum range.")
+    if row["macd"] >= 65:
+        notes.append("**MACD is positive** — short-term momentum leads the signal line.")
+    else:
+        notes.append("**MACD is weak/negative** — momentum has not confirmed the move.")
+    vr = row.get("vol_ratio", np.nan)
+    if np.isfinite(vr):
+        if vr < 1.2:
+            notes.append(f"**Volatility is contained** ({vr:.2f}× its own average).")
+        elif vr < 1.6:
+            notes.append(f"**Volatility is elevated** ({vr:.2f}× its own average).")
+        else:
+            notes.append(f"**Volatility is high** ({vr:.2f}× its own average) — wider risk.")
+    p = row["pos"]
+    zone = "near the high (breakout zone)" if p >= 70 else (
+        "mid-range" if p >= 30 else "near the low (dip zone)")
+    notes.append(f"**52-week range position {p:.0f}/100** — {zone}.")
+    best = max(comps, key=lambda x: x[1])[0]
+    worst = min(comps, key=lambda x: x[1])[0]
+    head = (f"Composite score **{row['score']:.1f}/100 → {row['label']}**. "
+            f"Strongest component: **{best}**; weakest: **{worst}**.")
+    return head, notes
+
+
+def walk_forward_table(bt, years=3):
+    """Split the backtest into rolling windows and score each out-of-sample block."""
+    if bt is None or len(bt) < 12:
+        return pd.DataFrame()
+    df = bt.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    start, end = df["date"].min(), df["date"].max()
+    rows = []
+    s = start
+    while s < end:
+        e = min(s + pd.DateOffset(years=years), end + pd.Timedelta(days=1))
+        sub = df[(df["date"] >= s) & (df["date"] < e)]
+        if len(sub) >= 6:
+            sr = float((1 + sub["strategy"]).prod() - 1)
+            br = float((1 + sub["benchmark"]).prod() - 1)
+            sd = sub["strategy"].std()
+            shp = (sub["strategy"].mean() / sd * np.sqrt(12)) if sd else np.nan
+            rows.append({"Window": f"{s.date()} → {(e - pd.Timedelta(days=1)).date()}",
+                         "Strategy %": sr * 100, "Benchmark %": br * 100,
+                         "Excess %": (sr - br) * 100, "Sharpe (strat)": shp,
+                         "Months": len(sub)})
+        s = e
+    return pd.DataFrame(rows)
+
+
+def weight_sensitivity(n=200, jitter=0.5):
+    """Perturb the 5 component weights and measure top-10 pick stability."""
+    base = {"trend": 0.22, "rsi": 0.22, "macd": 0.20, "vol": 0.18, "pos": 0.18}
+    base_top = set(SIG.nlargest(10, "score")["asset"])
+    rng = np.random.default_rng(42)
+    overlaps = []
+    for _ in range(n):
+        w = {k: max(0.01, base[k] * (1 + rng.uniform(-jitter, jitter))) for k in base}
+        tot = sum(w.values())
+        w = {k: v / tot for k, v in w.items()}
+        s = (SIG["trend"] * w["trend"] + SIG["rsi"] * w["rsi"] +
+             SIG["macd"] * w["macd"] + SIG["vol"] * w["vol"] +
+             SIG["pos"] * w["pos"])
+        top = set(SIG.assign(_s=s).nlargest(10, "_s")["asset"])
+        overlaps.append(len(base_top & top) / 10)
+    return np.array(overlaps)
+
+
+def record_snapshot():
+    st.session_state["sig_snapshot"] = dict(zip(SIG["asset"], SIG["label"]))
+    st.session_state["snapshot_time"] = pd.Timestamp.now()
+
+
+def signal_changes():
+    snap = st.session_state.get("sig_snapshot")
+    if not snap:
+        return pd.DataFrame()
+    now = dict(zip(SIG["asset"], SIG["label"]))
+    rows = [{"asset": a, "old": snap[a], "now": now[a]}
+            for a in now if a in snap and snap[a] != now[a]]
+    return pd.DataFrame(rows)
+
+
+def quick_update():
+    """Lightweight live update: pull the last month for every ticker, merge,
+    re-score and rewrite the CSVs (much faster than a full re-download)."""
+    import yfinance as yf
+    from multi_asset_advisor import UNIVERSE, CATEGORY, score_asset, backtest
+    raw = yf.download(list(UNIVERSE.values()), period="1mo", interval="1d",
+                      progress=False, auto_adjust=False, group_by="ticker",
+                      threads=True)
+    latest = {}
+    for name, tick in UNIVERSE.items():
+        try:
+            sub = raw[tick] if isinstance(raw.columns, pd.MultiIndex) else raw
+            col = ("Adj Close" if "Adj Close" in sub.columns and
+                   sub["Adj Close"].notna().any() else "Close")
+            s = sub[col].dropna()
+            if len(s):
+                latest[name] = s
+        except Exception:
+            continue
+    if not latest:
+        raise RuntimeError("no live prices downloaded")
+    upd = pd.DataFrame(latest)
+    upd.index = pd.to_datetime(upd.index).tz_localize(None)
+    combined = pd.concat([PX, upd]).sort_index()
+    combined = combined[~combined.index.duplicated(keep="last")].ffill()
+    rows = []
+    for name in combined.columns:
+        b = score_asset(combined[name])
+        rows.append({"asset": name, "category": CATEGORY.get(name, "Other"), **b})
+    sig = pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    bt = backtest(combined)
+    combined.to_csv("advisor_prices.csv")
+    sig.to_csv("advisor_signals.csv", index=False)
+    bt.to_csv("advisor_backtest.csv", index=False)
+    return sig, bt, combined
 
 
 try:
@@ -153,6 +394,40 @@ def tab_advisor():
         st.metric("Assets tracked", f"{len(mdf)}")
 
     st.markdown("---")
+    st.markdown("#### 👀 Watchlist & signal-change alerts")
+    all_assets = SIG.sort_values("asset")["asset"].tolist()
+    if "watchlist" not in st.session_state:
+        st.session_state["watchlist"] = SIG.head(5)["asset"].tolist()
+    watch = st.multiselect("Watchlist assets", all_assets, key="watchlist")
+    if watch:
+        wdf = SIG[SIG["asset"].isin(watch)][
+            ["asset", "category", "price", "score", "label"]].copy()
+        wdf["signal"] = wdf["label"].apply(lambda x: f"{EMOJI[x]} {x}")
+        st.dataframe(wdf[["asset", "category", "price", "score", "signal"]]
+                     .rename(columns={"asset": "Asset", "category": "Category",
+                                      "price": "Price", "score": "Score",
+                                      "signal": "Signal"}),
+                     width='stretch', hide_index=True)
+    ac1, ac2 = st.columns([1, 2])
+    with ac1:
+        if st.button("📌 Snapshot signals", key="snap_btn",
+                     help="Save current labels so later changes are flagged."):
+            record_snapshot()
+            st.success("Snapshot saved.")
+        if st.button("🧹 Clear snapshot", key="snap_clear"):
+            st.session_state.pop("sig_snapshot", None)
+        if st.session_state.get("snapshot_time") is not None:
+            st.caption(f"Snapshot: {st.session_state['snapshot_time']:%d %b %Y %H:%M}")
+    with ac2:
+        ch = signal_changes()
+        if not ch.empty:
+            for _, r in ch.iterrows():
+                st.warning(f"**{r['asset']}** — signal changed "
+                           f"{r['old']} → {r['now']}")
+        elif st.session_state.get("sig_snapshot"):
+            st.success("No signal changes since the last snapshot.")
+
+    st.markdown("---")
     st.markdown("#### Full ranked signal table")
     view = data.copy()
     view["signal"] = view["label"].apply(lambda x: f"{EMOJI[x]} {x}")
@@ -180,8 +455,19 @@ def tab_chart():
 
     n = st.slider("Years to show", 1, 10, 3, key="chart_years")
     idx = close.index[-n * 252:] if len(close) > n * 252 else close.index
+    oc1, oc2, oc3 = st.columns(3)
+    show_bb = oc1.checkbox("Bollinger Bands (20, 2σ)", value=True, key="show_bb")
+    show_atr = oc2.checkbox("ATR & ADX", value=True, key="show_atr")
+    show_vol = oc3.checkbox("Volume", value=True, key="show_vol")
 
     fig = go.Figure()
+    if show_bb:
+        bb_ma, bb_up, bb_lo = bollinger(close)
+        fig.add_trace(go.Scatter(x=idx, y=bb_up.loc[idx], name="BB upper",
+                                 line=dict(width=1, color="#90caf9", dash="dot")))
+        fig.add_trace(go.Scatter(x=idx, y=bb_lo.loc[idx], name="BB lower",
+                                 line=dict(width=1, color="#90caf9", dash="dot"),
+                                 fill="tonexty", fillcolor="rgba(144,202,249,0.08)"))
     fig.add_trace(go.Scatter(x=idx, y=close.loc[idx], name="Price",
                              line=dict(color="#2962ff", width=1.8)))
     fig.add_trace(go.Scatter(x=idx, y=e20.loc[idx], name="EMA20",
@@ -224,6 +510,54 @@ def tab_chart():
                        yaxis=dict(range=[0, 100]), hovermode="x unified",
                        yaxis2=dict(overlaying="y", side="right", showgrid=False))
     st.plotly_chart(fig2, width='stretch')
+
+    tick = UNIVERSE_TICK.get(asset)
+    if (show_atr or show_vol) and tick:
+        try:
+            ohlcv = fetch_ohlcv(tick)
+        except Exception:
+            ohlcv = pd.DataFrame()
+        if ohlcv.empty:
+            st.caption("OHLCV data unavailable right now — ATR/ADX/volume skipped.")
+        else:
+            sub = ohlcv.loc[ohlcv.index >= idx[0]]
+            if show_atr and {"High", "Low", "Close"}.issubset(ohlcv.columns):
+                pdi, mdi, adxv, atrv = adx_atr(ohlcv)
+                fig3 = go.Figure()
+                fig3.add_trace(go.Scatter(x=sub.index, y=adxv.loc[sub.index],
+                                          name="ADX",
+                                          line=dict(color="#ffb74d", width=1.4)))
+                fig3.add_trace(go.Scatter(x=sub.index, y=pdi.loc[sub.index],
+                                          name="+DI",
+                                          line=dict(color="#26a69a", width=1, dash="dot")))
+                fig3.add_trace(go.Scatter(x=sub.index, y=mdi.loc[sub.index],
+                                          name="−DI",
+                                          line=dict(color="#ef5350", width=1, dash="dot")))
+                fig3.add_hline(y=25, line=dict(color="gray", dash="dot", width=1))
+                fig3.update_layout(
+                    template="plotly_dark", height=260,
+                    title=dict(text=f"ADX / directional indicators · ATR(14) = "
+                                    f"{atrv.iloc[-1]:.2f}", font_size=12),
+                    margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified")
+                st.plotly_chart(fig3, width='stretch')
+            if show_vol and "Volume" in ohlcv.columns and ohlcv["Volume"].notna().any():
+                v = ohlcv["Volume"].loc[sub.index]
+                vc = np.where(v.pct_change().fillna(0) >= 0, "#26a69a", "#ef5350")
+                fig4 = go.Figure(go.Bar(x=sub.index, y=v, marker_color=vc))
+                fig4.update_layout(template="plotly_dark", height=220,
+                                   title=dict(text="Volume", font_size=12),
+                                   margin=dict(l=10, r=10, t=40, b=10))
+                st.plotly_chart(fig4, width='stretch')
+    elif show_atr or show_vol:
+        st.caption("No ticker mapping for this asset — ATR/ADX/volume skipped.")
+
+    with st.expander("🤖 Why this score? (rule-based explanation)"):
+        head, notes = explain_score(row)
+        st.markdown(head)
+        for nt in notes:
+            st.markdown(f"- {nt}")
+        st.caption("Generated from the five score components — deterministic and "
+                   "rule-based, not an AI/LLM model.")
 
 
 # ---------------------------------------------------------------- tab 3
@@ -278,6 +612,30 @@ def tab_backtest():
                          yaxis=dict(title="Drawdown %"), hovermode="x unified",
                          margin=dict(l=10, r=10, t=40, b=10))
     st.plotly_chart(fig_dd, width='stretch')
+
+    st.markdown("#### Walk-forward windows")
+    st.caption("Splits history into sequential out-of-sample blocks and checks "
+               "whether the edge is consistent or concentrated in one regime.")
+    wf_years = st.slider("Window length (years)", 2, 6, 3, key="wf_years")
+    wf = walk_forward_table(BT, wf_years)
+    if wf.empty:
+        st.info("Not enough backtest history for this window length.")
+    else:
+        st.dataframe(wf.round(2), width='stretch', hide_index=True)
+        fig_wf = go.Figure()
+        fig_wf.add_trace(go.Bar(x=wf["Window"], y=wf["Strategy %"],
+                                name="Strategy", marker_color="#26a69a"))
+        fig_wf.add_trace(go.Bar(x=wf["Window"], y=wf["Benchmark %"],
+                                name="Benchmark", marker_color="#fbc02d"))
+        fig_wf.update_layout(template="plotly_dark", height=320, barmode="group",
+                             title=dict(text="Return by walk-forward window (%)",
+                                        font_size=13),
+                             yaxis=dict(title="Return %"),
+                             margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig_wf, width='stretch')
+        beat = (wf["Excess %"] > 0).mean() * 100
+        st.caption(f"Strategy beat the benchmark in **{beat:.0f}%** of windows "
+                   f"({int((wf['Excess %'] > 0).sum())}/{len(wf)}).")
 
     st.warning(
         "⚠️ **Not financial advice.** Signals are purely technical and can be "
@@ -396,6 +754,30 @@ def tab_performance():
         st.markdown(f"- **{w}** — {df.loc[w, 'MaxDD']*100:.0f}% peak-to-trough "
                     f"(historical worst) · current score {SIG[SIG['asset']==w]['score'].iloc[0]:.0f}")
 
+    st.markdown("#### 📐 Risk-adjusted metrics (annualised)")
+    risk_rows = []
+    for col in df.index:
+        m = risk_metrics(col)
+        if m:
+            risk_rows.append({"asset": col, **m})
+    if risk_rows:
+        rdf = pd.DataFrame(risk_rows).set_index("asset")
+        show_cols = [a for a in view.index if a in rdf.index]
+        rv = rdf.loc[show_cols].copy()
+        for c in ["AnnRet", "Vol", "MaxDD"]:
+            rv[c] = rv[c] * 100
+        rv = rv.rename(columns={"AnnRet": "Ann. return %", "Vol": "Vol %",
+                                "Sharpe": "Sharpe", "Sortino": "Sortino",
+                                "MaxDD": "Max DD %"})
+        st.dataframe(rv.round(2), width='stretch')
+        st.caption("Sharpe/Sortino use daily returns annualised by √252 with a 0% "
+                   "risk-free rate. Max DD is measured over full available history.")
+        top_sharpe = rdf["Sharpe"].dropna().sort_values(ascending=False).head(5)
+        st.markdown("**Best Sharpe ratios:** " +
+                    ", ".join(f"{a} ({v:.2f})" for a, v in top_sharpe.items()))
+        st.download_button("📥 Download risk metrics CSV", rv.to_csv().encode(),
+                           "advisor_risk_metrics.csv", "text/csv", key="dl_risk")
+
 
 # ---------------------------------------------------------------- tab 6 port
 def tab_portfolio():
@@ -431,12 +813,14 @@ def tab_portfolio():
     n = len(top)
     total_score = sum(r["score"] for r in top)
     rows = []
+    weights = {}
     for r in top:
         if risk == "Conservative":
             share = 1.0 / n
         else:
             share = r["score"] / total_score
         allocate = round(budget * share, 0)
+        weights[r["asset"]] = share
         rows.append({"Asset": r["asset"], "Category": r["category"],
                      "Signal": r["label"], "Score": r["score"],
                      "Weight": f"{share*100:.1f}%",
@@ -445,6 +829,16 @@ def tab_portfolio():
     st.markdown(f"*{risk} strategy — invest across {len(top)} assets, "
                 f"{'higher weight to stronger scores' if risk != 'Conservative' else 'equal weight across all'}.*")
     st.dataframe(port_df, width='stretch')
+    pm = portfolio_risk(weights)
+    if pm:
+        st.markdown("#### 📐 Portfolio risk snapshot")
+        p1, p2, p3, p4 = st.columns(4)
+        p1.metric("Ann. return", f"{pm['AnnRet']*100:.1f}%")
+        p2.metric("Ann. volatility", f"{pm['Vol']*100:.1f}%")
+        p3.metric("Sharpe", f"{pm['Sharpe']:.2f}")
+        p4.metric("Max drawdown", f"{pm['MaxDD']*100:.1f}%")
+        st.caption("Computed on daily returns of the suggested weights "
+                   "(cash buffer excluded). Historical, not a forecast.")
     st.caption(f"Note: allocation is risk-score-weighted and category-diversified "
                f"(max 3 per category). Hold ~{w_hold*100:.0f}% cash buffer in built-up "
                f"risk. Not financial advice.")
@@ -849,6 +1243,27 @@ def tab_deep():
                       margin=dict(l=10, r=10, t=20, b=10))
     st.plotly_chart(fig, width='stretch')
 
+    st.markdown("#### 🎛️ Signal weight sensitivity")
+    st.caption("Randomly perturbs the 5 component weights 200 times and measures "
+               "how often the baseline top-10 picks survive. High overlap = robust.")
+    with st.spinner("Running weight perturbations..."):
+        overlaps = weight_sensitivity()
+    avg_overlap = float(overlaps.mean()) * 100
+    st.metric("Top-10 overlap with baseline", f"{avg_overlap:.0f}%")
+    verdict = ("Very robust" if avg_overlap >= 85 else
+               "Reasonably robust" if avg_overlap >= 70 else
+               "Weight-sensitive" if avg_overlap >= 50 else "Fragile")
+    st.markdown(f"**Robustness verdict: {verdict}**")
+    hist = go.Figure(go.Histogram(x=overlaps * 100, nbinsx=20,
+                                  marker_color="#42a5f5"))
+    hist.update_layout(template="plotly_dark", height=280,
+                       title=dict(text="Distribution of top-10 overlap (%)",
+                                  font_size=13),
+                       xaxis_title="Overlap %", yaxis_title="Count",
+                       margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(hist, width='stretch')
+    st.caption("A 50% jitter is applied to each weight before renormalising.")
+
 
 # ---------------------------------------------------------------- PDF export
 def export_pdf():
@@ -915,6 +1330,23 @@ def main():
                     st.success("Updated with live prices!")
                 except Exception as e:
                     st.error(f"Refresh failed: {e}")
+        if st.button("⚡ Quick price update", use_container_width=True,
+                     help="Faster: pulls the last month for all tickers and re-scores."):
+            with st.spinner("Pulling latest quotes..."):
+                try:
+                    SIG, BT, PX = quick_update()
+                    HAVE_DATA = True
+                    _build_cat()
+                    read_outputs.clear()
+                    st.success("Quick update done.")
+                except Exception as e:
+                    st.error(f"Quick update failed: {e}")
+        st.markdown("### 🔄 Auto-refresh")
+        auto = st.toggle("Enable auto-refresh", value=False, key="auto_refresh")
+        st.slider("Every (seconds)", 30, 300, 60, 30, key="auto_interval",
+                  disabled=not auto)
+        if auto:
+            st.caption("Pulls latest quotes and reruns on each cycle.")
         st.markdown("### 📄 Report")
         if st.button("📄 Download PDF report", use_container_width=True):
             pdf = export_pdf()
@@ -955,6 +1387,18 @@ def main():
         tab_heatmap()
     with tab13:
         tab_deep()
+
+    if st.session_state.get("auto_refresh"):
+        import time
+        time.sleep(int(st.session_state.get("auto_interval", 60)))
+        try:
+            SIG, BT, PX = quick_update()
+            HAVE_DATA = True
+            _build_cat()
+            read_outputs.clear()
+        except Exception:
+            pass
+        st.rerun()
 
 
 if __name__ == "__main__":
