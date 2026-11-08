@@ -239,9 +239,9 @@ A Graph Neural Network (PyTorch Geometric) was trained to predict **next-month c
 **Next steps (roadmap)**
 
 - [x] **Phase 6:** Interactive Streamlit dashboard — timeline slider, communities, spillover drill-down, VIX overlay, live refresh
-- [ ] Extend universe with FX pairs, crude oil, gold (macro factor nodes)
-- [ ] Rolling-window spillover index to track transmission through time
-- [ ] Tail-dependence networks (copula-based) and EVT-based contagion measures
+- [x] **Phase A:** Extend universe with FX pairs, crude oil, gold (macro factor nodes) — `phaseA_extended_universe_*.{csv,png}`
+- [x] **Phase 7:** Rolling-window spillover index to track transmission through time — `phase7_rolling_spillover.*`
+- [x] **Phase B:** Tail-dependence networks (copula-based) and EVT-based contagion measures — `phaseB_*`
 - [x] **Phase 8:** Graph Neural Network (GNN) for forward-looking contagion prediction
 - [ ] Reproduce analysis on intraday data to sharpen lead-lag estimates
 - [ ] Scale GNN to a larger stock-level universe where relational structure carries more signal

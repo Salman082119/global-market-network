@@ -100,6 +100,28 @@ The project also explores cross-asset relationships using:
 - Granger-causality analysis
 - Graph Neural Network experimentation
 
+### 🗂️ Dashboard Tabs
+
+The dashboard is organized into **13 tabs**:
+
+| Tab | What it shows |
+|---|---|
+| 📊 Advisor | 0–100 scores, Top Buys / Top Sells, today's movers, category & score filters |
+| 📈 Technicals | Per-asset price chart with EMA20/50/200, RSI and MACD overlays |
+| 📜 Backtest | Strategy vs benchmark compounding curve and running drawdown |
+| 🧭 Context | Correlation & contagion view of major indices |
+| 📈 Performance | 1M/3M/6M/1Y/YTD return heatmap and drawdown alerts |
+| 💼 Portfolio | Risk-appetite weighted allocation with category diversification |
+| 🎯 Presets | Momentum / Balanced / Swing / Long-term / Defensive signal weighting |
+| 🏅 Compare | Rebased price overlay and correlation between two assets |
+| 🔥 Market Move | Latest-session top gainers / losers and full move table |
+| 📰 News | Live Yahoo Finance headline sentiment for top-scored assets |
+| 🏆 52-Week | Assets near 52-week high (breakout) or low (dip watch) |
+| 🌐 Heatmap | Score treemap by category and region/sector allocation |
+| 📊 Deep | Correlation matrix, 200-day regime detector, sector rotation |
+
+The dashboard also supports a **dark/light theme toggle**, CSV exports and a **PDF report download**.
+
 ---
 
 ## 🌐 Asset Universe
