@@ -131,6 +131,28 @@ def tab_advisor():
             st.caption("No sells in this filter.")
 
     st.markdown("---")
+    st.markdown("#### 🔥 Today's top movers (quick)")
+    moves = {c: daily_move(c) for c in PX.columns}
+    moves = {k: v for k, v in moves.items() if v is not None and np.isfinite(v)}
+    mdf = pd.DataFrame({"asset": list(moves), "move": list(moves.values())})
+    mdf = mdf.sort_values("move", ascending=False)
+    mc1, mc2, mc3 = st.columns(3)
+    with mc1:
+        st.markdown("**Top gainers**")
+        for _, r in mdf.head(3).iterrows():
+            st.markdown(f"- {r['asset']}: **{r['move']*100:+.1f}%**")
+    with mc2:
+        st.markdown("**Top losers**")
+        for _, r in mdf.tail(3).iloc[::-1].iterrows():
+            st.markdown(f"- {r['asset']}: **{r['move']*100:+.1f}%**")
+    with mc3:
+        avg_move = mdf["move"].mean() * 100
+        up = (mdf["move"] > 0).mean() * 100
+        st.metric("Avg session move", f"{avg_move:+.2f}%")
+        st.metric("Share of assets up", f"{up:.0f}%")
+        st.metric("Assets tracked", f"{len(mdf)}")
+
+    st.markdown("---")
     st.markdown("#### Full ranked signal table")
     view = data.copy()
     view["signal"] = view["label"].apply(lambda x: f"{EMOJI[x]} {x}")
@@ -240,6 +262,22 @@ def tab_backtest():
                   f"{win*100:.0f}%")
         st.markdown(f"*Best month strategy: {BT['strategy'].max()*100:+.1f}% · "
                     f"worst: {BT['strategy'].min()*100:+.1f}%*")
+
+    st.markdown("#### Drawdown (peak-to-trough) — strategy vs benchmark")
+    strat_peak = strat.cummax()
+    bench_peak = bench.cummax()
+    fig_dd = go.Figure()
+    fig_dd.add_trace(go.Scatter(x=BT["date"], y=(strat / strat_peak - 1) * 100,
+                                name="Strategy drawdown %", fill="tozeroy",
+                                line=dict(color="#ef5350", width=1)))
+    fig_dd.add_trace(go.Scatter(x=BT["date"], y=(bench / bench_peak - 1) * 100,
+                                name="Benchmark drawdown %", fill="tozeroy",
+                                line=dict(color="#fbc02d", width=1, dash="dot")))
+    fig_dd.update_layout(template="plotly_dark", height=320,
+                         title=dict(text="Running drawdown (%)", font_size=13),
+                         yaxis=dict(title="Drawdown %"), hovermode="x unified",
+                         margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig_dd, width='stretch')
 
     st.warning(
         "⚠️ **Not financial advice.** Signals are purely technical and can be "
@@ -478,12 +516,390 @@ def tab_private():
         st.warning("These two are highly correlated — buying both is like buying "
                    "the same bet twice. Diversification is limited.")
 
+    st.markdown("#### 52-week context")
+    c1, c2 = st.columns(2)
+    for col, cdiv in [(a, c1), (b, c2)]:
+        c = PX[col].dropna().tail(270)
+        hi = c.max()
+        price = c.iloc[-1]
+        off_high = (price - hi) / hi * 100
+        with cdiv:
+            st.metric(f"{col} — off 52wk high", f"{off_high:.1f}%",
+                      f"price {price:.2f}")
+            st.caption("0% = at 52-week high (breakout zone); more negative = cheaper "
+                       "vs its high.")
+
+
+# ---------------------------------------------------------------- tab 9 move
+def daily_move(col):
+    c = PX[col].dropna()
+    if len(c) < 2:
+        return np.nan
+    return float(c.iloc[-1] / c.iloc[-2] - 1)
+
+
+def tab_move():
+    st.markdown("### 🔥 Market Move (latest session)")
+    moves = {c: daily_move(c) for c in PX.columns}
+    moves = {k: v for k, v in moves.items() if v is not None and np.isfinite(v)}
+    df = pd.DataFrame({"asset": list(moves), "move": list(moves.values())})
+    df["cat"] = df["asset"].map(CAT_IND)
+    df["move%"] = df["move"] * 100
+    df = df.sort_values("move", ascending=False)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### 📈 Top gainers")
+        g = df.head(6)
+        fig = go.Figure(go.Bar(x=g["move%"], y=g["asset"], orientation="h",
+                               marker_color="#26a69a"))
+        fig.update_layout(template="plotly_dark", height=280,
+                          xaxis_title="Move %", margin=dict(l=10, r=10, t=20, b=10))
+        st.plotly_chart(fig, width='stretch')
+    with c2:
+        st.markdown("#### 📉 Top losers")
+        l = df.tail(6).iloc[::-1]
+        fig = go.Figure(go.Bar(x=l["move%"], y=l["asset"], orientation="h",
+                               marker_color="#ef5350"))
+        fig.update_layout(template="plotly_dark", height=280,
+                          xaxis_title="Move %", margin=dict(l=10, r=10, t=20, b=10))
+        st.plotly_chart(fig, width='stretch')
+    st.markdown("#### Full session moves")
+    v = df[["asset", "cat", "move%"]].rename(columns={"asset": "Asset",
+                                                      "cat": "Category",
+                                                      "move%": "Move %"})
+    st.dataframe(v, width='stretch')
+    st.caption("Latest available trading session (last close vs previous close).")
+
+
+# ---------------------------------------------------------------- tab 10 news
+POS_WORDS = ["up", "gain", "beat", "surge", "rally", "record", "growth", "outperform",
+             "rise", "jump", "strong", "bullish", "profit", "upgrade", "positive"]
+NEG_WORDS = ["down", "fall", "miss", "drop", "crash", "loss", "weak", "downgrade",
+             "decline", "slump", "bearish", "sell", "worry", "fear", "inflation",
+             "recession", "negative", "cut", "lawsuit", "investigation"]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_news_sentiment(limit=10):
+    import yfinance as yf
+    out = []
+    tick_map = {r["asset"]: UNIVERSE_TICK.get(r["asset"]) for _, r in SIG.iterrows()}
+    scores = SIG.sort_values("score", ascending=False)["asset"].tolist()[:limit]
+    for asset in scores:
+        tick = tick_map.get(asset)
+        if not tick:
+            continue
+        try:
+            t = yf.Ticker(tick)
+            news = t.news[:8] if hasattr(t, "news") and t.news else []
+            if not news:
+                continue
+            text = " ".join(str(n.get("title", "")) + " " +
+                            " ".join(map(str, n.get("relatedTickers", [])))
+                            for n in news if isinstance(n, dict))
+            tl = text.lower()
+            pos = sum(1 for w in POS_WORDS if w in tl)
+            neg = sum(1 for w in NEG_WORDS if w in tl)
+            senti = (pos - neg) / (pos + neg) if (pos + neg) else 0.0
+            out.append({"asset": asset, "pos": pos, "neg": neg,
+                        "sentiment": round(senti, 2),
+                        "lean": "Positive" if senti > 0.15 else
+                                ("Negative" if senti < -0.15 else "Neutral"),
+                        "headlines": news[0]["title"] if news and isinstance(news[0], dict) else ""})
+        except Exception:
+            continue
+    return pd.DataFrame(out)
+
+
+UNIVERSE_TICK = {}
+
+
+def _build_ticks():
+    # reuse the tickers from the advisor universe module (lazy import handled in tab)
+    UNIVERSE_TICK.update({
+        "🇺🇸 S&P500": "^GSPC", "🇺🇸 NASDAQ100": "^NDX", "🇺🇸 Dow": "^DJI",
+        "🇮🇳 NIFTY50": "^NSEI", "🇮🇳 SENSEX": "^BSESN", "🇬🇧 FTSE100": "^FTSE",
+        "🇩🇪 DAX": "^GDAXI", "🇫🇷 CAC40": "^FCHI", "🇯🇵 Nikkei225": "^N225",
+        "🇭🇰 HangSeng": "^HSI", "🇨🇳 Shanghai": "000001.SS", "🇧🇷 Bovespa": "^BVSP",
+        "🇨🇦 TSX": "^GSPTSE", "🇦🇺 ASX200": "^AXJO",
+        "🍎 Apple": "AAPL", "🚀 Tesla": "TSLA", "🖥️ Microsoft": "MSFT",
+        "🔍 Google": "GOOGL", "🛒 Amazon": "AMZN", "📱 Meta": "META",
+        "🧠 NVIDIA": "NVDA", "🏦 JP Morgan": "JPM", "🥤 Coca-Cola": "KO",
+        "⚡ Reliance": "RELIANCE.NS", "💻 TCS": "TCS.NS", "🏦 HDFC Bank": "HDFCBANK.NS",
+        "🚗 Maruti": "MARUTI.NS", "☕ Asian Paints": "ASIANPAINT.NS",
+        "🥇 Gold": "GC=F", "🥈 Silver": "SI=F", "🗻 Platinum": "PL=F",
+        "💱 EUR/USD": "EURUSD=X", "💱 GBP/USD": "GBPUSD=X",
+        "💱 USD/JPY": "JPY=X", "💱 USD/INR": "INR=X", "💱 DXY Dollar": "DX-Y.NYB",
+        "🛢️ Crude WTI": "CL=F", "🛢️ Brent": "BZ=F", "🟠 Copper": "HG=F",
+        "😨 VIX": "^VIX", "₿ Bitcoin": "BTC-USD", "Ξ Ethereum": "ETH-USD"})
+
+
+def tab_news():
+    st.markdown("### 📰 News & Sentiment")
+    st.caption("Recent headlines mood for the top-scored assets (positive/negative "
+               "keyword count). News is live from Yahoo Finance.")
+    _build_ticks()
+    n_cnt = st.slider("How many assets to scan", 5, 20, 10, key="news_n")
+    with st.spinner("Fetching news..."):
+        df = fetch_news_sentiment(int(n_cnt))
+    if df.empty:
+        st.info("No recent news available right now.")
+        return
+    df = df.sort_values("sentiment", ascending=False)
+    colors = df["lean"].map({"Positive": "#26a69a", "Negative": "#ef5350",
+                             "Neutral": "#fbc02d"})
+    fig = go.Figure(go.Bar(x=df["sentiment"], y=df["asset"], orientation="h",
+                           marker_color=colors, text=df["lean"]))
+    fig.update_layout(template="plotly_dark", height=max(320, len(df) * 32),
+                      xaxis_title="Sentiment score (-1 negative … +1 positive)",
+                      margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(fig, width='stretch')
+    show = df[["asset", "pos", "neg", "sentiment", "lean", "headlines"]]
+    st.dataframe(show, width='stretch')
+
+
+# ---------------------------------------------------------------- tab 11 52wk
+def tab_week52():
+    st.markdown("### 🏆 52-Week Scan")
+    st.caption("Which assets sit near their 52-week high (breakout potential 🔥) or "
+               "deep near their 52-week low (dip watch 🎯).")
+    rows = []
+    for col in PX.columns:
+        c = PX[col].dropna().tail(270)
+        if len(c) < 60:
+            continue
+        hi = c.max()
+        lo = c.min()
+        price = c.iloc[-1]
+        dist_hi = (price - hi) / hi
+        dist_lo = (price - lo) / lo
+        rng = hi - lo if hi != lo else 0
+        pos52 = (price - lo) / rng if rng else 0.5
+        rows.append({"asset": col, "cat": CAT_IND.get(col), "price": price,
+                     "52w_high": hi, "52w_low": lo, "dist_from_high%": dist_hi * 100,
+                     "dist_from_low%": dist_lo * 100, "pos52": pos52 * 100})
+    df = pd.DataFrame(rows)
+    near_high = df[df["pos52"] >= 92].sort_values("pos52", ascending=False)
+    near_low = df[df["pos52"] <= 8].sort_values("pos52")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("#### 🔥 Near 52-week high (breakout)")
+        if len(near_high):
+            st.dataframe(near_high[["asset", "cat", "price", "dist_from_high%"]]
+                         .rename(columns={"asset": "Asset", "cat": "Category",
+                                          "price": "Price",
+                                          "dist_from_high%": "% off high"})
+                         .round(2), width='stretch')
+        else:
+            st.caption("No asset within 8% of 52-week high.")
+    with c2:
+        st.markdown("#### 🎯 Near 52-week low (dip watch)")
+        if len(near_low):
+            st.dataframe(near_low[["asset", "cat", "price", "dist_from_low%"]]
+                         .rename(columns={"asset": "Asset", "cat": "Category",
+                                          "price": "Price",
+                                          "dist_from_low%": "% above low"})
+                         .round(2), width='stretch')
+        else:
+            st.caption("No asset within 8% of 52-week low.")
+    st.markdown("#### Interactive 52-week position")
+    sel = st.multiselect("Select assets", df["asset"].tolist(),
+                         default=df["asset"].tolist()[:14], key="w52sel")
+    if sel:
+        fig = go.Figure()
+        for a in sel:
+            r = df[df["asset"] == a].iloc[0]
+            fig.add_trace(go.Bar(x=[a], y=[r["pos52"]], name=a,
+                                 marker_color=EMOJI_SCORE(r["pos52"])))
+        fig.update_layout(template="plotly_dark", height=400,
+                          yaxis=dict(range=[0, 100]),
+                          title=dict(text="52-week price position (% of range)",
+                                     font_size=13),
+                          margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, width='stretch')
+
+
+def EMOJI_SCORE(v):
+    return "#26a69a" if v >= 60 else "#fbc02d" if v >= 40 else "#ef5350"
+
+
+# ---------------------------------------------------------------- tab 12 heatmap
+def tab_heatmap():
+    st.markdown("### 🌐 Global Heatmap")
+    cats = ["All"] + sorted(SIG["category"].unique().tolist())
+    fc = st.selectbox("Category", cats, key="hm_cat")
+    data = SIG if fc == "All" else SIG[SIG["category"] == fc]
+    fig = px.treemap(data, path=["category", "asset"], values="score",
+                     color="label",
+                     color_discrete_map=LABEL_COLORS,
+                     title=None)
+    fig.update_traces(textinfo="label+value", textfont_size=14)
+    fig.update_layout(template="plotly_dark", height=560,
+                      margin=dict(l=10, r=10, t=30, b=10))
+    st.plotly_chart(fig, width='stretch')
+    st.markdown("#### Sector / country allocation")
+    data = data.copy()
+    data["country"] = data["asset"].apply(country_of)
+    alloc = data.groupby(["country", "label"]).size().reset_index(name="count")
+    fig2 = px.bar(alloc, x="country", y="count", color="label",
+                  color_discrete_map=LABEL_COLORS)
+    fig2.update_layout(template="plotly_dark", height=360,
+                       title=dict(text="Assets by region/sector", font_size=13),
+                       margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig2, width='stretch')
+    st.caption("Treemap: box size = signal score, colour = Strong Buy → Strong Sell.")
+
+
+COUNTRY_MAP = None
+
+
+def country_of(asset):
+    global COUNTRY_MAP
+    if COUNTRY_MAP is None:
+        COUNTRY_MAP = {
+            "🇺🇸 S&P500": "US", "🇺🇸 NASDAQ100": "US", "🇺🇸 Dow": "US",
+            "🇮🇳 NIFTY50": "India", "🇮🇳 SENSEX": "India", "🇬🇧 FTSE100": "Europe",
+            "🇩🇪 DAX": "Europe", "🇫🇷 CAC40": "Europe", "🇯🇵 Nikkei225": "Japan",
+            "🇭🇰 HangSeng": "Asia", "🇨🇳 Shanghai": "China", "🇧🇷 Bovespa": "LatAm",
+            "🇨🇦 TSX": "Canada", "🇦🇺 ASX200": "Australia",
+            "🍎 Apple": "US", "🚀 Tesla": "US", "🖥️ Microsoft": "US",
+            "🔍 Google": "US", "🛒 Amazon": "US", "📱 Meta": "US", "🧠 NVIDIA": "US",
+            "🏦 JP Morgan": "US", "🥤 Coca-Cola": "US", "⚡ Reliance": "India",
+            "💻 TCS": "India", "🏦 HDFC Bank": "India", "🚗 Maruti": "India",
+            "☕ Asian Paints": "India",
+            "🥇 Gold": "Metals", "🥈 Silver": "Metals", "🗻 Platinum": "Metals",
+            "💱 EUR/USD": "FX", "💱 GBP/USD": "FX", "💱 USD/JPY": "FX",
+            "💱 USD/INR": "FX", "💱 DXY Dollar": "FX",
+            "🛢️ Crude WTI": "Commodity", "🛢️ Brent": "Commodity", "🟠 Copper": "Commodity",
+            "😨 VIX": "Volatility", "₿ Bitcoin": "Crypto", "Ξ Ethereum": "Crypto"}
+    return COUNTRY_MAP.get(asset, "Other")
+
+
+# ---------------------------------------------------------------- tab 13 deep
+def tab_deep():
+    st.markdown("### 📊 Deep Analysis")
+    st.markdown("#### Correlation matrix (all assets)")
+    rets = PX.pct_change().dropna(how="all")
+    corr = rets.corr()
+    maxcols = 12
+    sel = st.multiselect("Select assets for matrix", corr.columns.tolist(),
+                         default=corr.columns.tolist()[:maxcols], key="corr_sel")
+    if len(sel) >= 2:
+        m = corr.loc[sel, sel].dropna(how="all").dropna(axis=1, how="all")
+        hm = px.imshow(m, text_auto=".2f", color_continuous_scale="RdYlGn",
+                       zmin=-0.2, zmax=1, aspect="auto")
+        hm.update_layout(template="plotly_dark", height=600,
+                         title=dict(text="Pairwise return correlation", font_size=13),
+                         margin=dict(l=10, r=10, t=44, b=10))
+        st.plotly_chart(hm, width='stretch')
+
+    st.markdown("#### Market regime detector (200-day)")
+    st.caption("Bull if price above its 200-day average & making progress; bear if "
+               "below; otherwise sideways.")
+    regs = []
+    for col in PX.columns:
+        c = PX[col].dropna().tail(400)
+        if len(c) < 200:
+            continue
+        ma200 = c.rolling(200).mean()
+        last = c.iloc[-1]
+        ma = ma200.iloc[-1]
+        pct_above = (c.iloc[-1] / c.iloc[-1 - 20] - 1) * 100 if len(c) > 240 else 0
+        if np.isnan(ma):
+            reg = "Sideways"
+        elif last > ma and pct_above > 1:
+            reg = "Bull"
+        elif last < ma and pct_above < -1:
+            reg = "Bear"
+        else:
+            reg = "Sideways"
+        regs.append({"asset": col, "cat": CAT_IND.get(col), "regime": reg,
+                     "20d%": round(pct_above, 2)})
+    rdf = pd.DataFrame(regs)
+    for r in ["Bull", "Sideways", "Bear"]:
+        sub = rdf[rdf["regime"] == r]
+        st.markdown(f"**{r}** — {len(sub)} assets")
+    rb = px.histogram(rdf, x="regime", color="regime",
+                      color_discrete_map={"Bull": "#26a69a", "Bear": "#ef5350",
+                                          "Sideways": "#fbc02d"})
+    rb.update_layout(template="plotly_dark", height=320,
+                     title=dict(text="Regime distribution", font_size=13),
+                     margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(rb, width='stretch')
+
+    st.markdown("#### Sector rotation (3M momentum by category)")
+    mom = {}
+    lookback = 63
+    for col in PX.columns:
+        c = PX[col].dropna()
+        if len(c) > lookback:
+            mom[col] = c.iloc[-1] / c.iloc[-1 - lookback] - 1
+    cat_mom = {}
+    for col, m in mom.items():
+        cat = CAT_IND.get(col, "Other")
+        cat_mom.setdefault(cat, []).append(m)
+    cm = pd.DataFrame({"category": [k for k in cat_mom],
+                       "avg_3m_mom": [np.mean(v) * 100 for v in cat_mom.values()]})
+    cm = cm.sort_values("avg_3m_mom", ascending=False)
+    fig = go.Figure(go.Bar(x=cm["avg_3m_mom"], y=cm["category"], orientation="h",
+                           marker_color=["#26a69a" if v > 0 else "#ef5350"
+                                         for v in cm["avg_3m_mom"]]))
+    fig.update_layout(template="plotly_dark", height=360,
+                      xaxis_title="Avg 3-month momentum %",
+                      margin=dict(l=10, r=10, t=20, b=10))
+    st.plotly_chart(fig, width='stretch')
+
+
+# ---------------------------------------------------------------- PDF export
+def export_pdf():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.backends.backend_pdf import PdfPages
+    buf = None
+    try:
+        import io
+        buf = io.BytesIO()
+        with PdfPages(buf) as pdf:
+            # table page
+            fig, ax = plt.subplots(figsize=(11, 8.5))
+            ax.axis("off")
+            tbl = SIG[["asset", "category", "price", "score", "label"]].copy()
+            tbl.columns = ["Asset", "Category", "Price", "Score", "Signal"]
+            tab = ax.table(cellText=tbl.values, colLabels=tbl.columns,
+                           loc="center", cellLoc="left")
+            tab.auto_set_font_size(False)
+            tab.set_fontsize(7)
+            tab.scale(1, 1.4)
+            ax.set_title("Global Multi-Asset Advisor Report", fontsize=14, pad=20)
+            pdf.savefig(fig, bbox_inches="tight")
+            plt.close(fig)
+            # score distribution page
+            fig, ax = plt.subplots(figsize=(8, 5))
+            ax.hist(SIG["score"], bins=20, color="#42a5f5")
+            ax.set_title("Signal score distribution")
+            ax.set_xlabel("Score")
+            ax.set_ylabel("Count")
+            pdf.savefig(fig)
+            plt.close(fig)
+        buf.seek(0)
+        return buf.getvalue()
+    except Exception as e:
+        st.error(f"PDF export failed: {e}")
+        return None
+
 
 # ------------------------------------------------------------------ main
 def main():
     global SIG, BT, PX, HAVE_DATA
     advisor_header()
     with st.sidebar:
+        st.markdown("### 🌗 Theme")
+        theme = st.radio("Theme", ["Dark", "Light"], horizontal=True,
+                         index=0, key="theme")
+        if theme == "Light":
+            st.markdown("<style>section.main{filter:invert(1) hue-rotate(180deg);"
+                        "}</style>", unsafe_allow_html=True)
         st.markdown("### ⚙️ Data")
         last_date = PX.index.max().date() if HAVE_DATA and len(PX) else None
         st.caption(f"Prices through **{last_date}**")
@@ -499,13 +915,20 @@ def main():
                     st.success("Updated with live prices!")
                 except Exception as e:
                     st.error(f"Refresh failed: {e}")
+        st.markdown("### 📄 Report")
+        if st.button("📄 Download PDF report", use_container_width=True):
+            pdf = export_pdf()
+            if pdf is not None:
+                st.download_button("Save report.pdf", pdf, "advisor_report.pdf",
+                                   "application/pdf")
     if not HAVE_DATA:
         return
     _build_cat()
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs(
-        ["📊 Buy/Sell Advisor", "📈 Price & Technicals",
-         "📜 Backtest & Honesty", "🧭 Market Context",
-         "📈 Performance", "💼 Portfolio", "🎯 Strategy Presets", "🏅 Compare"])
+    _build_ticks()
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12, tab13 = st.tabs(
+        ["📊 Advisor", "📈 Technicals", "📜 Backtest", "🧭 Context",
+         "📈 Performance", "💼 Portfolio", "🎯 Presets", "🏅 Compare",
+         "🔥 Market Move", "📰 News", "🏆 52-Week", "🌐 Heatmap", "📊 Deep"])
     with tab1:
         tab_advisor()
     with tab2:
@@ -522,6 +945,16 @@ def main():
         tab_strategy()
     with tab8:
         tab_private()
+    with tab9:
+        tab_move()
+    with tab10:
+        tab_news()
+    with tab11:
+        tab_week52()
+    with tab12:
+        tab_heatmap()
+    with tab13:
+        tab_deep()
 
 
 if __name__ == "__main__":
